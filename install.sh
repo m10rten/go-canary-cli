@@ -7,6 +7,8 @@
 #                             or stable, rc: rc or stable, beta: beta, rc or stable, alpha:
 #                             alpha, beta, rc or stable). CANARY_VERSION takes precedence.
 #   CANARY_INSTALL_DIR        install directory (default: ~/.local/bin)
+#   CANARY_NO_MODIFY_PATH     set to 1 to not add the install directory to your shell profile
+#                             when it is not on PATH (default: it is added)
 #   CANARY_DOWNLOAD_BASE_URL  mirror for release assets, fetched as <base>/<tag>/<asset>.
 #                             Requires CANARY_VERSION. Must start with https:// or file://
 #                             (file:// needs curl). checksums.txt comes from the same
@@ -234,15 +236,62 @@ verify_checksum() {
     die "checksum mismatch for $2 (expected $want, got $got). Nothing was installed."
 }
 
+# Adds dir to PATH in the profile of the login shell. Returns 1, having changed
+# nothing, when that is opted out of, unsafe to quote or not possible, so the
+# caller falls back to the hint.
+add_to_profile() {
+  [ "${CANARY_NO_MODIFY_PATH:-}" != 1 ] || return 1
+  [ -n "${HOME:-}" ] || return 1
+  case $dir in
+    *\'* | *\\* | *'
+'*) return 1 ;;
+  esac
+  line="export PATH='$dir':\"\$PATH\""
+  login_shell=${SHELL:-}
+  case ${login_shell##*/} in
+    zsh) profile=${ZDOTDIR:-$HOME}/.zshrc ;;
+    bash)
+      # Linux: a login shell that reads an existing ~/.bash_profile or ~/.bash_login
+      # without sourcing ~/.bashrc will not see this.
+      profile=$HOME/.bashrc
+      if [ "$goos" = darwin ]; then
+        # Terminal starts login shells, which read only the first of these that exists.
+        profile=$HOME/.bash_profile
+        for f in .bash_profile .bash_login .profile; do
+          if [ -f "$HOME/$f" ]; then
+            profile=$HOME/$f
+            break
+          fi
+        done
+      fi
+      ;;
+    fish)
+      profile=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/canary.fish
+      line="set -gx PATH '$dir' \$PATH"
+      ;;
+    '' | sh | dash | ksh | ash) profile=$HOME/.profile ;;
+    *) return 1 ;;
+  esac
+  # Idempotent on the exact line only: an equivalent line written by hand may be duplicated.
+  if [ -f "$profile" ] && grep -qxF "$line" "$profile"; then
+    say "$profile already adds $dir to your PATH"
+  else
+    { mkdir -p "$(dirname "$profile")" &&
+      printf '\n# added by canary install.sh\n%s\n' "$line" >>"$profile"; } 2>/dev/null || return 1
+    say "Added $dir to your PATH in $profile"
+  fi
+  say "Open a new terminal to use canary, or run: $line"
+}
+
 report() {
   case ":$PATH:" in
-    *":$dir:"*)
+    *":$dir:"* | *":$dir/:"*)
       found=$(command -v canary 2>/dev/null || true)
       if [ -n "$found" ] && [ "$(resolved_path "$found")" != "$(physical_path "$dir/canary")" ]; then
         say "warning: $found comes first on PATH and will shadow the canary installed in $dir"
       fi
       ;;
-    *) say "$dir is not on your PATH. Add it with: export PATH=\"$dir:\$PATH\"" ;;
+    *) add_to_profile || say "$dir is not on your PATH. Add it with: export PATH=\"$dir:\$PATH\"" ;;
   esac
 }
 

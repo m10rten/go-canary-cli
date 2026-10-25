@@ -79,6 +79,8 @@ jobs:
     env:
       CI_TAG: v0.0.0-ci
       CANARY_DOWNLOAD_BASE_URL: file://${{ github.workspace }}/mirror
+      # Keeps the other steps from editing the runner's shell profiles. The profile step unsets it.
+      CANARY_NO_MODIFY_PATH: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -300,6 +302,146 @@ jobs:
           ln -s "$dir/canary" "$linked/canary"
           PATH="$linked:$dir:$PATH" run_install
           ! grep -qF "will shadow" "$RUNNER_TEMP/path.err" || fail "shadow warning for a symlink to the installed canary"
+      - name: Install zsh and fish to check the profile lines
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh fish
+      - name: Install directory is added to the shell profile
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          unset CANARY_NO_MODIFY_PATH ZDOTDIR XDG_CONFIG_HOME
+          marker="# added by canary install.sh"
+
+          install_in() {
+            home=$1
+            shift
+            rc=0
+            env HOME="$home" CANARY_VERSION="$CI_TAG" "$@" sh install.sh 2>"$RUNNER_TEMP/profile.err" </dev/null || rc=$?
+            cat "$RUNNER_TEMP/profile.err"
+            return "$rc"
+          }
+          files_in() { find "$1" -type f | sort; }
+
+          # setup: none, nonl (profile exists without a final newline), symlink (profile is a
+          # symlink), zdotdir, xdg, or pre:<file> (that file exists first). On bash, expected is
+          # bash:<file macOS writes>; Linux always writes .bashrc.
+          while IFS='|' read -r shell runner subdir setup expected; do
+            home=$(mktemp -d "$RUNNER_TEMP/profile-home.XXXXXX")
+            dir="$RUNNER_TEMP/profile dirs/$subdir"
+            label="SHELL=$shell dir=$subdir setup=$setup"
+            case $expected in
+              bash:*) if [ "$(uname -s)" = Darwin ]; then expected=${expected#bash:}; else expected=.bashrc; fi ;;
+            esac
+            file="$home/$expected"
+            content=$file
+            premade=
+            zdotdir=
+            xdg=
+            case $setup in
+              zdotdir) zdotdir="$home/zdot" ;;
+              xdg) xdg="$home/xdg" ;;
+              nonl)
+                premade=$file
+                printf '# mine' >"$file"
+                ;;
+              symlink)
+                content="$home/real-profile"
+                premade=$content
+                printf '# mine\n' >"$content"
+                ln -s "$content" "$file"
+                ;;
+              pre:*)
+                premade="$home/${setup#pre:}"
+                printf '# mine\n' >"$premade"
+                ;;
+            esac
+            before=$(files_in "$home")
+
+            run_case() { install_in "$home" SHELL="$shell" ZDOTDIR="$zdotdir" XDG_CONFIG_HOME="$xdg" CANARY_INSTALL_DIR="$dir"; }
+            run_case || fail "$label: install failed"
+            [ "$(files_in "$home")" = "$(printf '%s\n%s\n' "$before" "$content" | grep . | sort -u)" ] || fail "$label: expected only $content to be added"
+            [ "$setup" != symlink ] || [ -L "$file" ] || fail "$label: the symlinked profile was replaced"
+            [ "$premade" != "$content" ] || [ "$(head -n 1 "$content")" = "# mine" ] || fail "$label: the existing profile content was not preserved"
+            grep -qF "Added $dir to your PATH in $file" "$RUNNER_TEMP/profile.err" || fail "$label: missing the changed-file message"
+            grep -qF "Open a new terminal" "$RUNNER_TEMP/profile.err" || fail "$label: missing the use-it-now message"
+            ! grep -qF "is not on your PATH" "$RUNNER_TEMP/profile.err" || fail "$label: printed the hint after editing the profile"
+
+            run_case || fail "$label: second install failed"
+            [ "$(grep -cxF "$marker" "$content")" -eq 1 ] || fail "$label: the marker is not there exactly once"
+            [ "$(grep -cF "$dir" "$content")" -eq 1 ] || fail "$label: the directory is not there exactly once"
+            grep -qF "already adds $dir" "$RUNNER_TEMP/profile.err" || fail "$label: missing the already-added message"
+
+            if command -v "$runner" >/dev/null 2>&1; then
+              case $runner in
+                fish) got=$(F="$file" fish -c 'source $F; string join : $PATH') ;;
+                *) got=$(F="$file" "$runner" -c '. "$F"; printf %s "$PATH"') ;;
+              esac
+              case ":$got:" in
+                *":$dir:"*) ;;
+                *) fail "$label: sourcing $file in $runner did not put the directory on PATH" ;;
+              esac
+            elif [ "$runner" = fish ] && [ "$(uname -s)" = Darwin ]; then
+              echo "fish is not installed, skipped sourcing $file"
+            else
+              fail "$label: $runner is not installed"
+            fi
+          done <<'EOF'
+          /bin/zsh|zsh|bin|none|.zshrc
+          /bin/zsh|zsh|with space/bin|none|.zshrc
+          zsh|zsh|bin|none|.zshrc
+          /bin/zsh|zsh|bin|nonl|.zshrc
+          /bin/zsh|zsh|bin|symlink|.zshrc
+          /bin/zsh|zsh|bin|zdotdir|zdot/.zshrc
+          /bin/bash|bash|bin|none|bash:.bash_profile
+          /bin/bash|bash|with space/bin|none|bash:.bash_profile
+          bash|bash|bin|none|bash:.bash_profile
+          /bin/bash|bash|bin|pre:.profile|bash:.profile
+          /bin/bash|bash|bin|pre:.bash_login|bash:.bash_login
+          /usr/bin/fish|fish|bin|none|.config/fish/conf.d/canary.fish
+          /usr/bin/fish|fish|with space/bin|none|.config/fish/conf.d/canary.fish
+          /usr/bin/fish|fish|bin|xdg|xdg/fish/conf.d/canary.fish
+          /bin/sh|sh|bin|none|.profile
+          /bin/sh|sh|with space/bin|none|.profile
+          /bin/dash|sh|bin|none|.profile
+          |sh|bin|none|.profile
+          EOF
+
+          # No profile edit: shells without a rule, a quote in the directory, directory already on PATH.
+          while IFS='|' read -r shell subdir pathmode hint; do
+            home=$(mktemp -d "$RUNNER_TEMP/profile-home.XXXXXX")
+            dir="$RUNNER_TEMP/profile dirs/$subdir"
+            label="SHELL=$shell dir=$subdir path=$pathmode"
+            case $pathmode in
+              exact) path="$dir:$PATH" ;;
+              slash) path="$dir/:$PATH" ;;
+              *) path=$PATH ;;
+            esac
+            install_in "$home" SHELL="$shell" CANARY_INSTALL_DIR="$dir" PATH="$path" || fail "$label: install failed"
+            [ -z "$(files_in "$home")" ] || fail "$label: a profile was written"
+            ! grep -qF "Added" "$RUNNER_TEMP/profile.err" || fail "$label: reported a profile edit"
+            if [ "$hint" = yes ]; then
+              grep -qF "$dir is not on your PATH" "$RUNNER_TEMP/profile.err" || fail "$label: missing the PATH hint"
+            else
+              ! grep -qF "is not on your PATH" "$RUNNER_TEMP/profile.err" || fail "$label: printed the PATH hint"
+            fi
+          done <<'EOF'
+          /bin/tcsh|bin|none|yes
+          /usr/bin/nu|bin|none|yes
+          /bin/zsh|it's/bin|none|yes
+          /bin/zsh|bin|exact|no
+          /bin/zsh|bin|slash|no
+          EOF
+
+          home=$(mktemp -d "$RUNNER_TEMP/profile-home.XXXXXX")
+          dir="$RUNNER_TEMP/profile-optout"
+          install_in "$home" SHELL=/bin/zsh CANARY_INSTALL_DIR="$dir" CANARY_NO_MODIFY_PATH=1 || fail "opt-out: install failed"
+          [ -z "$(files_in "$home")" ] || fail "opt-out: a profile was written"
+          grep -qF "$dir is not on your PATH" "$RUNNER_TEMP/profile.err" || fail "opt-out: missing the PATH hint"
+
+          mkdir "$home/.profile"
+          install_in "$home" SHELL=/bin/sh CANARY_INSTALL_DIR="$dir" || fail "unwritable profile: the install failed"
+          grep -qF "$dir is not on your PATH" "$RUNNER_TEMP/profile.err" || fail "unwritable profile: missing the PATH hint"
       - name: Unsupported mirror schemes are rejected
         run: |
           fail() { echo "::error::$*"; exit 1; }
