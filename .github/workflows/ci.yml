@@ -1,0 +1,424 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+
+  # Built with a CI version (v0.0.0-ci) for PR packaging tests only. This is not
+  # the release artifact: release.yml builds its own dist/ from the tag.
+  dist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make dist VERSION=v0.0.0-ci
+      - name: Verify checksums
+        working-directory: dist
+        run: |
+          sha256sum -c checksums.txt
+          # 6 is the number of TARGETS in the Makefile; update it together with them.
+          test "$(wc -l < checksums.txt)" -eq 6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  install-sh:
+    name: install.sh (${{ matrix.os }})
+    needs: dist
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_TAG: v0.0.0-ci
+      CANARY_DOWNLOAD_BASE_URL: file://${{ github.workspace }}/mirror
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Uses the shellcheck preinstalled on the ubuntu-24.04 image.
+      - name: shellcheck
+        if: matrix.os == 'ubuntu-24.04'
+        run: shellcheck install.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Stage release mirror
+        run: |
+          mkdir -p "mirror/$CI_TAG"
+          cp dist/* "mirror/$CI_TAG/"
+      - name: Install, both names, info
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          case "$(uname -m)" in
+            x86_64) host_arch=amd64 ;;
+            aarch64 | arm64) host_arch=arm64 ;;
+            *) fail "unexpected architecture $(uname -m)" ;;
+          esac
+
+          dir="$RUNNER_TEMP/ok"
+          tmpdir="$RUNNER_TEMP/tmp-ok"
+          mkdir -p "$tmpdir"
+          TMPDIR="$tmpdir" CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh 2>"$RUNNER_TEMP/ok.err"
+          cat "$RUNNER_TEMP/ok.err"
+          grep -qF "warning: CANARY_DOWNLOAD_BASE_URL is set" "$RUNNER_TEMP/ok.err" || fail "the mirror override did not warn"
+          [ -z "$(ls -A "$tmpdir")" ] || fail "a successful install left temporary files behind"
+          real=$(cd "$dir" && pwd -P)
+          [ "$(readlink "$dir/go-canary-cli")" = canary ] || fail "go-canary-cli is not a relative symlink to canary"
+          for name in canary go-canary-cli; do
+            line=$("$dir/$name" --version)
+            echo "$name: $line"
+            case "$line" in
+              "canary $CI_TAG (commit "*", $host_os/$host_arch)") ;;
+              *) fail "$name printed an unexpected version line" ;;
+            esac
+            [ "$("$dir/$name" info --json)" = "{\"path\":\"$real/canary\",\"channel\":\"install.sh\",\"version\":\"$CI_TAG\"}" ] ||
+              fail "$name info --json did not report channel install.sh and the resolved path"
+          done
+      - name: Default directory, CANARY_VERSION and CANARY_INSTALL_DIR are honored
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          mkdir -p "$RUNNER_TEMP/home"
+          HOME="$RUNNER_TEMP/home" CANARY_VERSION="$CI_TAG" sh install.sh
+          [ -x "$RUNNER_TEMP/home/.local/bin/canary" ] || fail "default directory ~/.local/bin was not used"
+
+          if CANARY_VERSION=v9.9.9 CANARY_INSTALL_DIR="$RUNNER_TEMP/pinned" sh install.sh 2>"$RUNNER_TEMP/pinned.err"; then
+            fail "an unknown CANARY_VERSION installed"
+          fi
+          grep -qF v9.9.9 "$RUNNER_TEMP/pinned.err" || fail "CANARY_VERSION was not the tag that was requested"
+          [ ! -e "$RUNNER_TEMP/pinned" ] || fail "a failed install created its directory"
+
+          if sh install.sh 2>"$RUNNER_TEMP/unpinned.err"; then
+            fail "install.sh ran against a mirror without CANARY_VERSION"
+          fi
+          grep -qF "CANARY_VERSION is required" "$RUNNER_TEMP/unpinned.err" || fail "missing CANARY_VERSION message"
+      - name: Bad checksums abort and leave the target untouched
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          case "$(uname -m)" in x86_64) host_arch=amd64 ;; *) host_arch=arm64 ;; esac
+          archive="canary_${CI_TAG#v}_${host_os}_${host_arch}.tar.gz"
+
+          for testcase in mismatch missing malformed; do
+            mirror="$RUNNER_TEMP/bad-$testcase"
+            mkdir -p "$mirror/$CI_TAG"
+            cp dist/* "$mirror/$CI_TAG/"
+            case "$testcase" in
+              mismatch)
+                awk -v a="$archive" '$2 == a { $1 = sprintf("%064d", 0) } { print $1 "  " $2 }' dist/checksums.txt >"$mirror/$CI_TAG/checksums.txt"
+                want="checksum mismatch"
+                ;;
+              missing)
+                grep -vF "$archive" dist/checksums.txt >"$mirror/$CI_TAG/checksums.txt"
+                want="no line for $archive"
+                ;;
+              malformed)
+                awk -v a="$archive" '$2 == a { $1 = substr($1, 1, 63) } { print $1 "  " $2 }' dist/checksums.txt >"$mirror/$CI_TAG/checksums.txt"
+                want="malformed line for $archive"
+                ;;
+            esac
+
+            dir="$RUNNER_TEMP/target-$testcase"
+            tmpdir="$RUNNER_TEMP/tmp-$testcase"
+            mkdir -p "$dir" "$tmpdir"
+            echo old >"$dir/canary"
+            if TMPDIR="$tmpdir" CANARY_DOWNLOAD_BASE_URL="file://$mirror" CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh 2>"$dir.err"; then
+              fail "$testcase: install succeeded"
+            fi
+            cat "$dir.err"
+            grep -qF "$want" "$dir.err" || fail "$testcase: unexpected error message"
+            [ "$(cat "$dir/canary")" = old ] || fail "$testcase: existing canary was modified"
+            [ "$(ls -A "$dir")" = canary ] || fail "$testcase: install left files behind"
+            [ -z "$(ls -A "$tmpdir")" ] || fail "$testcase: a failed install left temporary files behind"
+          done
+
+          mirror="$RUNNER_TEMP/bad-crlf"
+          mkdir -p "$mirror/$CI_TAG"
+          cp dist/* "$mirror/$CI_TAG/"
+          awk '{ printf "%s\r\n", $0 }' dist/checksums.txt >"$mirror/$CI_TAG/checksums.txt"
+          dir="$RUNNER_TEMP/target-crlf"
+          tmpdir="$RUNNER_TEMP/tmp-crlf"
+          mkdir -p "$tmpdir"
+          TMPDIR="$tmpdir" CANARY_DOWNLOAD_BASE_URL="file://$mirror" CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh ||
+            fail "crlf: install with CRLF checksums failed"
+          [ -x "$dir/canary" ] || fail "crlf: canary was not installed"
+          [ -z "$(ls -A "$tmpdir")" ] || fail "crlf: a successful install left temporary files behind"
+      - name: Existing alias that points at a directory is replaced
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          dir="$RUNNER_TEMP/alias-dir"
+          linked="$RUNNER_TEMP/alias-linked"
+          mkdir -p "$dir" "$linked"
+          ln -s "$linked" "$dir/go-canary-cli"
+          CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh
+          [ "$(readlink "$dir/go-canary-cli")" = canary ] || fail "the alias was not replaced with a symlink to canary"
+          [ -z "$(ls -A "$linked")" ] || fail "the install wrote through the alias into its directory"
+      - name: Package-manager directories are refused
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          refused() {
+            if CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$1" sh install.sh 2>"$RUNNER_TEMP/refused.err"; then
+              fail "$1 was not refused"
+            fi
+            grep -qF "refusing to install" "$RUNNER_TEMP/refused.err" || fail "$1: unexpected error message"
+          }
+
+          for segment in Cellar Caskroom node_modules chocolatey CELLAR NODE_MODULES; do
+            refused "$RUNNER_TEMP/managed/$segment/canary/bin"
+          done
+          [ ! -e "$RUNNER_TEMP/managed" ] || fail "a refused install created directories"
+
+          mkdir -p "$RUNNER_TEMP/real/node_modules/bin"
+          ln -s "$RUNNER_TEMP/real/node_modules/bin" "$RUNNER_TEMP/via-link"
+          refused "$RUNNER_TEMP/via-link"
+          [ -z "$(ls -A "$RUNNER_TEMP/real/node_modules/bin")" ] || fail "a refused install wrote through a symlinked directory"
+
+          mkdir -p "$RUNNER_TEMP/linked/bin"
+          ln -s ../Cellar/canary/0.0.0/bin/canary "$RUNNER_TEMP/linked/bin/canary"
+          refused "$RUNNER_TEMP/linked/bin"
+          [ "$(readlink "$RUNNER_TEMP/linked/bin/canary")" = ../Cellar/canary/0.0.0/bin/canary ] || fail "a refused install changed the symlink"
+      - name: A directory at the install path is refused
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          target="$RUNNER_TEMP/dir-target"
+          mkdir -p "$target"
+          for kind in directory symlink; do
+            dir="$RUNNER_TEMP/dir-$kind"
+            mkdir -p "$dir"
+            case "$kind" in
+              directory) mkdir "$dir/canary" ;;
+              symlink) ln -s "$target" "$dir/canary" ;;
+            esac
+            if CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh 2>"$RUNNER_TEMP/dir.err"; then
+              fail "$kind: install replaced a directory"
+            fi
+            cat "$RUNNER_TEMP/dir.err"
+            grep -qF "is a directory or a symlink to one" "$RUNNER_TEMP/dir.err" || fail "$kind: unexpected error message"
+            [ "$(ls -A "$dir")" = canary ] || fail "$kind: install left files behind"
+            [ -z "$(ls -A "$target")" ] || fail "$kind: the install wrote into the directory"
+          done
+      - name: Windows shells are refused
+        run: |
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          printf '#!/bin/sh\necho MINGW64_NT-10.0\n' >"$RUNNER_TEMP/fakebin/uname"
+          chmod +x "$RUNNER_TEMP/fakebin/uname"
+          if PATH="$RUNNER_TEMP/fakebin:$PATH" CANARY_VERSION="$CI_TAG" sh install.sh 2>"$RUNNER_TEMP/msys.err"; then
+            echo "::error::install.sh ran in a Windows shell"
+            exit 1
+          fi
+          grep -qF npm "$RUNNER_TEMP/msys.err"
+          grep -qF Chocolatey "$RUNNER_TEMP/msys.err"
+      # The real `curl -fsSL <raw URL> | sh` against a published release is checked
+      # outside PR CI, because it needs a release that already exists.
+      - name: Piped install reads the script from stdin
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          dir="$RUNNER_TEMP/piped"
+          cat install.sh | CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh
+          [ "$(readlink "$dir/go-canary-cli")" = canary ] || fail "piped install did not create the alias"
+          case "$("$dir/canary" --version)" in
+            "canary $CI_TAG (commit "*) ;;
+            *) fail "piped install produced an unexpected version line" ;;
+          esac
+      - name: PATH hint and shadow warning
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          dir="$RUNNER_TEMP/path-dir"
+          early="$RUNNER_TEMP/path-early"
+          linked="$RUNNER_TEMP/path-linked"
+          mkdir -p "$early" "$linked"
+          printf '#!/bin/sh\n' >"$early/canary"
+          chmod +x "$early/canary"
+
+          run_install() {
+            CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh 2>"$RUNNER_TEMP/path.err"
+            cat "$RUNNER_TEMP/path.err"
+          }
+
+          run_install
+          grep -qF "is not on your PATH" "$RUNNER_TEMP/path.err" || fail "missing the PATH hint"
+          ! grep -qF "will shadow" "$RUNNER_TEMP/path.err" || fail "shadow warning without the directory on PATH"
+
+          PATH="$early:$PATH" run_install
+          grep -qF "is not on your PATH" "$RUNNER_TEMP/path.err" || fail "missing the PATH hint with an earlier canary"
+          ! grep -qF "will shadow" "$RUNNER_TEMP/path.err" || fail "shadow warning without the directory on PATH"
+
+          PATH="$early:$dir:$PATH" run_install
+          grep -qF "will shadow" "$RUNNER_TEMP/path.err" || fail "missing the shadow warning"
+          ! grep -qF "is not on your PATH" "$RUNNER_TEMP/path.err" || fail "PATH hint with the directory on PATH"
+
+          ln -s "$dir/canary" "$linked/canary"
+          PATH="$linked:$dir:$PATH" run_install
+          ! grep -qF "will shadow" "$RUNNER_TEMP/path.err" || fail "shadow warning for a symlink to the installed canary"
+      - name: Unsupported mirror schemes are rejected
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          for url in http://example.invalid/mirror ftp://example.invalid/mirror "$RUNNER_TEMP/mirror"; do
+            dir="$RUNNER_TEMP/scheme-target"
+            if CANARY_DOWNLOAD_BASE_URL="$url" CANARY_VERSION="$CI_TAG" CANARY_INSTALL_DIR="$dir" sh install.sh 2>"$RUNNER_TEMP/scheme.err"; then
+              fail "$url was accepted as a mirror"
+            fi
+            cat "$RUNNER_TEMP/scheme.err"
+            grep -qF "must start with https:// or file://" "$RUNNER_TEMP/scheme.err" || fail "$url: unexpected error message"
+            [ ! -e "$dir" ] || fail "$url: a rejected mirror created the install directory"
+          done
+      - name: CANARY_TRACK installs the newest release on the track's path
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          unset CANARY_DOWNLOAD_BASE_URL
+          host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          case "$(uname -m)" in x86_64) host_arch=amd64 ;; *) host_arch=arm64 ;; esac
+
+          # A stand-in for the downloader that serves the GitHub API and the release
+          # assets from fixtures, so the real URLs and the default (non-mirror) path run.
+          stub="$RUNNER_TEMP/track"
+          mkdir -p "$stub/bin"
+          cat >"$stub/bin/curl" <<'EOF'
+          #!/bin/sh
+          out=
+          url=
+          while [ $# -gt 0 ]; do
+            case $1 in
+              -o) out=$2; shift ;;
+              https://*) url=$1 ;;
+            esac
+            shift
+          done
+          echo "$url" >>"$STUB_LOG"
+          case $url in
+            https://api.github.com/repos/*/releases/latest) printf '{\n  "tag_name": "%s"\n}\n' "$STUB_LATEST" >"$out" ;;
+            https://api.github.com/repos/*/releases\?*) cp "$STUB_RELEASES" "$out" ;;
+            https://github.com/*/releases/download/*) cp "$STUB_MIRROR/${url#*/releases/download/}" "$out" ;;
+            *) echo "stub: unexpected URL $url" >&2; exit 1 ;;
+          esac
+          EOF
+          chmod +x "$stub/bin/curl"
+
+          # Every release is the CI build under another tag, so only the tag differs.
+          stage() {
+            mkdir -p "$stub/mirror/$1"
+            cp "dist/canary_0.0.0-ci_${host_os}_${host_arch}.tar.gz" "$stub/mirror/$1/canary_${1#v}_${host_os}_${host_arch}.tar.gz"
+            sed "s/canary_0\.0\.0-ci_/canary_${1#v}_/" dist/checksums.txt >"$stub/mirror/$1/checksums.txt"
+          }
+          for tag in v1.0.0 v1.5.0 v1.10.0 v1.0.1-nightly.20260102 v1.2.0-rc.1 v1.3.0-beta.10 v1.4.0-alpha.2 "$CI_TAG"; do stage "$tag"; done
+
+          # tag:draft pairs. Every body holds an escaped copy of a release that must not be read.
+          write_releases() {
+            n=0
+            echo '['
+            for pair in "$@"; do
+              [ "$n" -eq 0 ] || echo ','
+              n=1
+              printf '  {\n    "tag_name": "%s",\n    "draft": %s,\n    "body": "{\\"tag_name\\": \\"v9.9.9\\", \\"draft\\": false}"\n  }' "${pair%:*}" "${pair#*:}"
+            done
+            echo
+            echo ']'
+          }
+
+          install_track() {
+            dir=$(mktemp -d "$RUNNER_TEMP/track-dir.XXXXXX")
+            : >"$stub/log"
+            env PATH="$stub/bin:$PATH" STUB_LOG="$stub/log" STUB_LATEST=v1.5.0 STUB_RELEASES="$stub/releases.json" STUB_MIRROR="$stub/mirror" \
+              CANARY_INSTALL_DIR="$dir" "$@" sh install.sh >"$stub/out" 2>"$stub/err" </dev/null
+          }
+
+          noise="v1.2.0-rc.0:false vfoo:false v9.9.9-nightly.20991231:true v1.0.1-nightly.2026010:false v9.9.9-ci:false"
+          while IFS='|' read -r track releases want; do
+            for layout in pretty compact crlf; do
+              # shellcheck disable=SC2086
+              write_releases $releases $noise | case $layout in
+                compact) tr -d '\n ' ;;
+                crlf) awk '{ printf "%s\r\n", $0 }' ;;
+                *) cat ;;
+              esac >"$stub/releases.json"
+              install_track CANARY_TRACK="$track" || { cat "$stub/err"; fail "$track $layout: install failed"; }
+              [ "$(cat "$stub/out")" = "Installed canary $want to $dir (alias: go-canary-cli)" ] || { cat "$stub/out"; fail "$track $layout: expected $want"; }
+              real=$(cd "$dir" && pwd -P)
+              [ "$("$dir/canary" info --json)" = "{\"path\":\"$real/canary\",\"channel\":\"install.sh\",\"version\":\"$CI_TAG\"}" ] ||
+                fail "$track $layout $want: info --json did not report channel install.sh"
+            done
+          done <<'EOF'
+          nightly|v1.0.0:false v1.0.1-nightly.20260101:false v1.0.1-nightly.20260102:false|v1.0.1-nightly.20260102
+          nightly|v1.0.1-nightly.20260102:false v1.5.0:false v1.0.0:false|v1.5.0
+          nightly|v1.9.0:false v1.10.0:false v1.2.0:false|v1.10.0
+          beta|v1.2.0-beta.1:false v1.2.0-rc.1:false v1.5.0:false v1.0.0:false|v1.5.0
+          beta|v1.0.0:false v1.2.0-beta.1:false v1.2.0-rc.1:false v1.0.1-nightly.20260102:false|v1.2.0-rc.1
+          beta|v1.3.0-beta.9:false v1.3.0-beta.10:false v1.3.0-beta.2:false|v1.3.0-beta.10
+          alpha|v1.4.0-alpha.1:false v1.4.0-alpha.2:false v1.3.0-beta.10:false|v1.4.0-alpha.2
+          alpha|v1.3.0-alpha.7:false v1.3.0-beta.10:false|v1.3.0-beta.10
+          rc|v1.2.0-rc.1:false v1.3.0-beta.10:false v1.2.0-alpha.4:false|v1.2.0-rc.1
+          rc|v1.2.0-rc.1:false v1.5.0:false v1.4.0-alpha.2:false|v1.5.0
+          EOF
+
+          write_releases v1.0.0:false v1.2.0-rc.1:false >"$stub/releases.json"
+          install_track || fail "the default track failed"
+          grep -qF "Installed canary v1.5.0 to" "$stub/out" || fail "the default track did not use releases/latest"
+          grep -qF "/releases/latest" "$stub/log" || fail "the default track did not ask for the latest release"
+          ! grep -qF "/releases?" "$stub/log" || fail "the default track read the releases list"
+
+          install_track CANARY_TRACK=nightly CANARY_VERSION="$CI_TAG" || fail "CANARY_VERSION with CANARY_TRACK failed"
+          grep -qF "Installed canary $CI_TAG to" "$stub/out" || fail "CANARY_VERSION did not win over CANARY_TRACK"
+          ! grep -qF api.github.com "$stub/log" || fail "CANARY_VERSION still queried the API"
+
+          # A draft flag that comes before its tag_name still belongs to that release.
+          printf '[{"draft":true,"tag_name":"v1.5.0"},{"draft":false,"tag_name":"v1.0.0"}]' >"$stub/releases.json"
+          install_track CANARY_TRACK=nightly || { cat "$stub/err"; fail "draft before tag_name: install failed"; }
+          grep -qF "Installed canary v1.0.0 to" "$stub/out" || fail "a draft before its tag_name was attached to the wrong release"
+
+          write_releases v9.9.9-nightly.20991231:true vfoo:false >"$stub/releases.json"
+          if install_track CANARY_TRACK=nightly; then fail "a list with only drafts and unparseable tags installed"; fi
+          grep -qF "no release found on the nightly track" "$stub/err" || fail "missing the no-release message"
+
+          if install_track CANARY_TRACK=Nightly; then fail "an unknown track installed"; fi
+          cat "$stub/err"
+          grep -qF "CANARY_TRACK must be one of stable, nightly, alpha, beta or rc, got: Nightly" "$stub/err" || fail "unexpected unknown-track message"

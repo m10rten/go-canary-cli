@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: Nightly releases to keep (default 14, lower it only to test retention)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'push' && 'release' || 'release-nightly' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.tag.outputs.publish || steps.nightly.outputs.publish }}
+      tag: ${{ steps.tag.outputs.tag || steps.nightly.outputs.tag }}
+      track: ${{ steps.tag.outputs.track || steps.nightly.outputs.track }}
+      prerelease: ${{ steps.tag.outputs.prerelease || steps.nightly.outputs.prerelease }}
+      dist_tag: ${{ steps.tag.outputs.dist_tag || steps.nightly.outputs.dist_tag }}
+      commit: ${{ steps.tag.outputs.commit || steps.nightly.outputs.commit }}
+      create_tag: ${{ steps.nightly.outputs.create_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Validate tag
+        id: tag
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          result=$(make -s release-classify) || {
+            echo "::error::Tag '$TAG' is not a release tag. Releases use vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N, with no build suffix. Nightly tags are created by the workflow."
+            exit 1
+          }
+          {
+            echo "publish=true"
+            echo "tag=$TAG"
+            echo "commit=$SHA"
+            printf '%s\n' "$result"
+          } >> "$GITHUB_OUTPUT"
+      - name: Refuse an already published release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          published=$(gh api --paginate "repos/$GH_REPO/releases" |
+            jq -s --arg tag "$TAG" '[.[][] | select(.tag_name == $tag and .draft == false)] | length')
+          if [ "$published" -gt 0 ]; then
+            echo "::error::Release $TAG is already published. \"Re-run all jobs\" would rebuild different bytes. Use \"Re-run failed jobs\" on the original run to recover."
+            exit 1
+          fi
+      - name: Resolve nightly
+        id: nightly
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          fail() { echo "::error::$1"; exit 1; }
+          field() { printf '%s\n' "$plan" | sed -n "s/^$1=//p"; }
+          has_line() { printf '%s\n' "$2" | awk -v want="$1" '$0 == want { found = 1 } END { exit !found }'; }
+
+          [ "$REF" = refs/heads/main ] || fail "Nightly releases run from main only, not $REF."
+          main_head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha) ||
+            fail "Could not read the head of main."
+          [ "$main_head" = "$SHA" ] ||
+            fail "This run is for $SHA, but main is at $main_head. Re-runs of old runs are not allowed."
+
+          refs=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref')
+          tags=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||')
+          NIGHTLY_DATE=$(date -u +%Y%m%d)
+          export NIGHTLY_DATE
+          plan=$(printf '%s\n' "$tags" | make -s release-next-nightly) ||
+            fail "Could not derive the next nightly tag."
+          tag=$(field tag)
+          newest=$(field newest)
+          exists=$(field exists)
+          [ -n "$tag" ] || fail "The nightly tag derivation printed no tag."
+
+          create_tag=true
+          if [ -n "$newest" ]; then
+            newest_commit=$(gh api "repos/$GH_REPO/commits/$newest" --jq .sha)
+            if [ "$exists" = true ] && [ "$newest_commit" != "$SHA" ]; then
+              fail "Nightly $tag already exists on commit $newest_commit, but main is at $SHA. There is one nightly per UTC day. Wait for tomorrow's run, or delete the release and tag $tag to build it again from main."
+            fi
+            if [ "$newest_commit" = "$SHA" ]; then
+              published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false) | .tag_name')
+              if has_line "$newest" "$published"; then
+                echo "::notice::No changes on main since $newest. No nightly this run."
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::notice::Resuming $newest, which has no published release."
+              tag=$newest
+              create_tag=false
+            fi
+          fi
+
+          {
+            echo "publish=true"
+            echo "tag=$tag"
+            echo "track=nightly"
+            echo "prerelease=true"
+            echo "dist_tag=nightly"
+            echo "commit=$SHA"
+            echo "create_tag=$create_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make test
+      - name: Build
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: VERSION="$TAG" make dist
+      - name: Verify checksums
+        working-directory: dist
+        run: |
+          sha256sum -c checksums.txt
+          test "$(wc -l < checksums.txt)" -eq 6
+          test "$(ls -1 | wc -l)" -eq 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  attest:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+  release:
+    needs: [resolve, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Verify or create the nightly tag
+        if: needs.resolve.outputs.track == 'nightly'
+        env:
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          CREATE_TAG: ${{ needs.resolve.outputs.create_tag }}
+        run: |
+          set -eu
+          fail() { echo "::error::$1"; exit 1; }
+          err=$(mktemp)
+          if found=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha' 2>"$err"); then
+            type=${found%% *}
+            sha=${found#* }
+            [ "$type" = commit ] ||
+              fail "Tag $TAG is a $type object, not a lightweight tag. Refusing to compare it to commit $COMMIT."
+            [ "$sha" = "$COMMIT" ] ||
+              fail "Tag $TAG points to $sha, not $COMMIT. The tag was moved after it was resolved."
+            echo "Tag $TAG already points to $COMMIT."
+            exit 0
+          fi
+          grep -q 'HTTP 404' "$err" || {
+            cat "$err" >&2
+            fail "Could not look up tag $TAG."
+          }
+          [ "$CREATE_TAG" = true ] || fail "Tag $TAG is missing, but it was expected on $COMMIT."
+          gh api -X POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$COMMIT" --silent
+          echo "Created tag $TAG on $COMMIT."
+      - name: Create or complete the release
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          (cd dist && sha256sum -c checksums.txt)
+
+          fail() { echo "::error::$1"; exit 1; }
+          in_list() {
+            local item
+            for item in "${@:2}"; do
+              [ "$item" = "$1" ] && return 0
+            done
+            return 1
+          }
+          uploaded() {
+            gh release view "$TAG" --json assets \
+              --jq '.assets[] | select(.state == "uploaded") | .name' | sort
+          }
+
+          expected_names=$({ awk '{print $2}' dist/checksums.txt; echo checksums.txt; } | sort)
+          [ "$(ls -1 dist | sort)" = "$expected_names" ] ||
+            fail "Files in dist/ differ from the archives listed in checksums.txt plus checksums.txt itself"
+          mapfile -t expected <<<"$expected_names"
+
+          case "$PRERELEASE" in
+            true) release_flags=(--prerelease --latest=false) ;;
+            false) release_flags=(--prerelease=false --latest) ;;
+            *) fail "Unknown prerelease value '$PRERELEASE' for $TAG" ;;
+          esac
+
+          matches=$(gh api --paginate "repos/$GH_REPO/releases" |
+            jq -s --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]')
+          case "$(jq length <<<"$matches")" in
+            0)
+              gh release create "$TAG" --draft --generate-notes --verify-tag "${release_flags[@]}"
+              is_draft=true
+              ;;
+            1)
+              is_draft=$(jq -r '.[0].draft' <<<"$matches")
+              ;;
+            *)
+              fail "More than one release exists for $TAG"
+              ;;
+          esac
+
+          if [ "$is_draft" = true ]; then
+            # Drop half-uploaded assets left by a failed run so they are uploaded again.
+            stale_names=$(gh release view "$TAG" --json assets \
+              --jq '.assets[] | select(.state != "uploaded") | .name')
+            if [ -n "$stale_names" ]; then
+              while read -r name; do
+                gh release delete-asset "$TAG" "$name" --yes
+              done <<<"$stale_names"
+            fi
+          fi
+
+          present_names=$(uploaded)
+          present=()
+          [ -z "$present_names" ] || mapfile -t present <<<"$present_names"
+          mkdir existing
+          for name in "${present[@]}"; do
+            in_list "$name" "${expected[@]}" || fail "Release $TAG has unexpected asset $name"
+            gh release download "$TAG" --pattern "$name" --dir existing
+            if ! cmp -s "dist/$name" "existing/$name"; then
+              sha256sum "dist/$name" "existing/$name"
+              if [ "$is_draft" = true ]; then
+                hint="The draft is stale. Delete the draft release and re-run."
+              else
+                hint="Use \"Re-run failed jobs\" on the original run."
+              fi
+              fail "Asset $name on release $TAG differs from this build. \"Re-run all jobs\" rebuilds different bytes. $hint Refusing to overwrite it."
+            fi
+          done
+
+          missing=()
+          for name in "${expected[@]}"; do
+            in_list "$name" "${present[@]}" || missing+=("dist/$name")
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            [ "$is_draft" = true ] || fail "Published release $TAG is missing ${#missing[@]} asset(s). Refusing to modify a published release."
+            gh release upload "$TAG" "${missing[@]}"
+          fi
+
+          [ "$(uploaded)" = "$(printf '%s\n' "${expected[@]}")" ] ||
+            fail "Release $TAG does not hold exactly the expected assets"
+
+          if [ "$is_draft" = true ]; then
+            gh release edit "$TAG" --draft=false "${release_flags[@]}"
+          fi
+          [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false ] ||
+            fail "Release $TAG is still a draft"
+          [ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = "$PRERELEASE" ] ||
+            fail "Release $TAG does not have the prerelease flag $PRERELEASE"
+          echo "Release $TAG is published with all ${#expected[@]} assets."
+
+  prune-nightlies:
+    needs: [resolve, release]
+    if: needs.resolve.outputs.track == 'nightly'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Delete nightlies beyond the keep count
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KEEP: ${{ inputs.keep }}
+        run: |
+          set -eu
+          fail() { echo "::error::$1"; exit 1; }
+          has_line() { printf '%s\n' "$2" | awk -v want="$1" '$0 == want { found = 1 } END { exit !found }'; }
+
+          keep=${KEEP:-14}
+          case "$keep" in *[!0-9]*) fail "The keep count must be a whole number, got '$keep'." ;; esac
+          [ "$keep" -ge 1 ] || fail "The keep count must be 1 or more, got '$keep'."
+
+          refs=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref')
+          tags=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||')
+          doomed=$(printf '%s\n' "$tags" | KEEP="$keep" make -s release-prune-nightlies) ||
+            fail "Could not select the nightlies to delete."
+          if [ -z "$doomed" ]; then
+            echo "No nightlies beyond the newest $keep."
+            exit 0
+          fi
+
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name')
+          while read -r tag; do
+            case "$tag" in
+              v*-nightly.*) ;;
+              *) fail "Refusing to delete $tag, it is not a nightly tag." ;;
+            esac
+            if has_line "$tag" "$releases"; then
+              gh release delete "$tag" --yes
+            fi
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" --silent
+            echo "Deleted nightly $tag."
+          done <<<"$doomed"
+
+  # ---------------------------------------------------------------------------
+  # Channel hook points (placeholders, not jobs). Each job below must declare
+  # `needs: release` so it only runs after the GitHub release is public.
+  #
+  # Read the tag, track and dist_tag from needs.resolve.outputs and add
+  # `resolve` to needs. Gate Homebrew and Chocolatey on track == 'stable'.
+  #
+  # publish-npm        (task 5): needs: release, permissions: id-token: write
+  # publish-homebrew   (task 4): needs: release
+  # publish-chocolatey (task 6): needs: release
+  # smoke              (task 7): needs: [release, publish-npm, publish-homebrew,
+  #                              publish-chocolatey], calls the reusable smoke
+  #                              workflow with from = previous release and
+  #                              to = needs.resolve.outputs.tag
+  # ---------------------------------------------------------------------------
