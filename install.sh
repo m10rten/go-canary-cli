@@ -134,6 +134,7 @@ refuse_managed() {
 # the JSON does not matter. Inside a string value every quote is escaped, so a
 # "tag_name" or "draft" key at the start of a line is never part of a release body.
 highest_in_path() {
+  # shellcheck disable=SC2020 # maps both , and { to newline
   tr -d '\r\n' <"$2" | tr ',{' '\n\n' | awk -v path=" $1 " '
     function pad(s) {
       while (length(s) < 20) s = "0" s
