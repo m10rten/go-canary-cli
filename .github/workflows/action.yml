@@ -1,0 +1,219 @@
+name: Action
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # An independent answer to "what is the latest stable release", for the default-version rows.
+  latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+    steps:
+      - id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: m10rten/go-canary-cli
+        run: echo "tag=$(gh release view --json tagName --jq .tagName)" >> "$GITHUB_OUTPUT"
+
+  # version: pinned tag, default is the latest stable. track: expects whatever is newest on
+  # that track, so only self-consistency is checked. install_dir: custom directory.
+  # image: runs the job in that container, after prepare. fails: the action must fail, and
+  # reason is the text its output must contain.
+  test:
+    name: ${{ matrix.name }}
+    needs: latest
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: ${{ matrix.os == 'windows-latest' && 'bash' || 'sh' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ubuntu latest, os: ubuntu-latest }
+          - { name: ubuntu v0.1.0 in install-dir, os: ubuntu-latest, version: v0.1.0, install_dir: .tools/canary-bin }
+          - { name: ubuntu rc track, os: ubuntu-latest, track: rc }
+          - { name: macos latest, os: macos-latest }
+          - { name: macos v0.1.0, os: macos-latest, version: v0.1.0 }
+          - { name: windows latest, os: windows-latest }
+          - { name: windows v0.1.0 in install-dir, os: windows-latest, version: v0.1.0, install_dir: .tools/canary-bin }
+          - { name: windows rc track, os: windows-latest, track: rc }
+          - { name: ubuntu container latest, os: ubuntu-latest, image: 'ubuntu:24.04', prepare: 'apt-get update && apt-get install -y --no-install-recommends curl ca-certificates' }
+          - { name: debian container v0.1.0, os: ubuntu-latest, image: 'debian:12-slim', prepare: 'apt-get update && apt-get install -y --no-install-recommends curl ca-certificates', version: v0.1.0 }
+          - { name: alpine container latest, os: ubuntu-latest, image: 'alpine:3.22', prepare: 'apk add --no-cache curl' }
+          - { name: alpine container v0.1.0, os: ubuntu-latest, image: 'alpine:3.22', prepare: 'apk add --no-cache curl', version: v0.1.0 }
+          - { name: alpine container rc track, os: ubuntu-latest, image: 'alpine:3.22', prepare: 'apk add --no-cache curl', track: rc }
+          # Relies on busybox wget lacking --https-only, so install.sh finds no usable downloader.
+          - { name: alpine container without curl fails, os: ubuntu-latest, image: 'alpine:3.22', fails: true, reason: 'this wget does not support --https-only' }
+          - { name: ubuntu unknown track fails, os: ubuntu-latest, track: bogus, fails: true, reason: 'CANARY_TRACK must be one of' }
+    steps:
+      - name: Install a downloader
+        if: matrix.prepare
+        env:
+          PREPARE: ${{ matrix.prepare }}
+        run: eval "$PREPARE"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install canary
+        id: canary
+        continue-on-error: ${{ matrix.fails == true }}
+        uses: ./
+        with:
+          version: ${{ matrix.version }}
+          track: ${{ matrix.track }}
+          install-dir: ${{ matrix.install_dir }}
+      - name: Check the install
+        if: matrix.fails != true
+        env:
+          EXPECTED: ${{ matrix.version || (matrix.track && 'any') || needs.latest.outputs.tag }}
+          OUT_VERSION: ${{ steps.canary.outputs.version }}
+          OUT_PATH: ${{ steps.canary.outputs.path }}
+          INSTALL_DIR: ${{ matrix.install_dir }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          [ -n "$OUT_VERSION" ] || fail "the version output is empty"
+          [ -n "$OUT_PATH" ] || fail "the path output is empty"
+          [ "$EXPECTED" = any ] || [ "$OUT_VERSION" = "$EXPECTED" ] || fail "version output is $OUT_VERSION, expected $EXPECTED"
+          [ -f "$OUT_PATH" ] || fail "the path output $OUT_PATH is not a file"
+          if [ -n "$INSTALL_DIR" ]; then
+            case "$(printf '%s' "$OUT_PATH" | tr '\\' '/')" in
+              */"$INSTALL_DIR"/canary | */"$INSTALL_DIR"/canary.exe) ;;
+              *) fail "the path output $OUT_PATH is not in $INSTALL_DIR" ;;
+            esac
+          fi
+
+          command -v canary >/dev/null || fail "canary is not on PATH"
+          line=$(canary version)
+          echo "$line"
+          case "$line" in
+            "canary $OUT_VERSION (commit "*) ;;
+            *) fail "canary version does not report $OUT_VERSION" ;;
+          esac
+          [ "$("$OUT_PATH" version)" = "$line" ] || fail "canary on PATH is not the binary at the path output"
+      - name: Check the install failed, said why and left nothing behind
+        if: matrix.fails == true
+        env:
+          OUTCOME: ${{ steps.canary.outcome }}
+          OUT_VERSION: ${{ steps.canary.outputs.version }}
+          OUT_PATH: ${{ steps.canary.outputs.path }}
+          REASON: ${{ matrix.reason }}
+          CANARY_VERSION: ${{ matrix.version }}
+          CANARY_TRACK: ${{ matrix.track }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          [ "$OUTCOME" = failure ] || fail "the action finished with $OUTCOME, expected failure"
+          [ -z "$OUT_VERSION" ] || fail "the version output is $OUT_VERSION after a failed install"
+          [ -z "$OUT_PATH" ] || fail "the path output is $OUT_PATH after a failed install"
+          ! command -v canary >/dev/null || fail "canary is on PATH after a failed install"
+
+          # A composite action's log is not readable from a later step, so install.sh
+          # runs again here to capture the reason. Nothing it fails on touches the network.
+          sinks=$(mktemp -d)
+          if CANARY_INSTALL_DIR="$sinks/bin" CANARY_NO_MODIFY_PATH=1 sh "$GITHUB_WORKSPACE/install.sh" >"$sinks/log" 2>&1; then
+            fail "install.sh succeeded when run directly"
+          fi
+          cat "$sinks/log"
+          grep -qF -- "$REASON" "$sinks/log" || fail "the failure output does not contain: $REASON"
+
+  # install.ps1 on its own, with the user PATH edit that the action skips. The runner is
+  # ephemeral, so writing the registry is fine.
+  windows-standalone:
+    name: windows install.ps1 standalone
+    needs: latest
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Parse install.ps1 with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\install.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host "::error::$($_.Message) (line $($_.Extent.StartLineNumber))" }
+            exit 1
+          }
+      - name: Parse install.ps1 with pwsh
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$env:GITHUB_WORKSPACE\install.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host "::error::$($_.Message) (line $($_.Extent.StartLineNumber))" }
+            exit 1
+          }
+      - name: Seed the user PATH with an unexpanded entry
+        shell: powershell
+        run: |
+          $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $existing = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $seed = if ($existing) { "$existing;%USERPROFILE%\canary-seed" } else { '%USERPROFILE%\canary-seed' }
+          $key.SetValue('Path', $seed, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+          $key.Close()
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "CANARY_INSTALL_DIR=$env:RUNNER_TEMP\standalone\bin`n")
+      - name: Run install.ps1 twice from a file
+        shell: powershell
+        env:
+          CANARY_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          foreach ($run in 1, 2) {
+            powershell -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\install.ps1"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Check the user PATH and the install
+        shell: powershell
+        env:
+          EXPECTED: ${{ needs.latest.outputs.tag }}
+        run: |
+          function Fail([string]$Message) { Write-Host "::error::$Message"; exit 1 }
+
+          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $kind = $key.GetValueKind('Path')
+          $key.Close()
+          Write-Host "Path ($kind): $raw"
+
+          if ($kind -ne 'ExpandString') { Fail "the Path value kind is $kind, expected ExpandString" }
+          $entries = $raw -split ';'
+          if ($entries -cnotcontains '%USERPROFILE%\canary-seed') { Fail 'the %USERPROFILE%\canary-seed entry was expanded or removed' }
+          $count = @($entries | Where-Object { $_.TrimEnd('\', '/') -eq $env:CANARY_INSTALL_DIR }).Count
+          if ($count -ne 1) { Fail "$env:CANARY_INSTALL_DIR is on the user PATH $count times, expected once" }
+
+          $line = & "$env:CANARY_INSTALL_DIR\canary.exe" version | Select-Object -First 1
+          Write-Host $line
+          if ($line -notlike "canary $env:EXPECTED (commit *") { Fail "canary version does not report $env:EXPECTED" }
+      - name: Run install.ps1 through Invoke-Expression
+        shell: powershell
+        env:
+          CANARY_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          function Fail([string]$Message) { Write-Host "::error::$Message"; exit 1 }
+
+          # Native stderr must not stop this step, since install.ps1 reports errors there.
+          $ErrorActionPreference = 'Continue'
+          # A failing install must not close the session either: install.ps1 only exits when run from a file.
+          foreach ($track in 'stable', 'bogus') {
+            $env:CANARY_TRACK = $track
+            $out = powershell -NoProfile -Command "Get-Content '$env:GITHUB_WORKSPACE\install.ps1' -Raw | Invoke-Expression; Write-Host 'session-alive'" 2>&1 | Out-String
+            Write-Host $out
+            if ($out -notmatch 'session-alive') { Fail "the session was closed by install.ps1 on the $track track" }
+          }

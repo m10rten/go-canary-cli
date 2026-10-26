@@ -13,6 +13,9 @@
 #                             Requires CANARY_VERSION. Must start with https:// or file://
 #                             (file:// needs curl). checksums.txt comes from the same
 #                             base, so verification is only as trustworthy as the mirror.
+#   CANARY_GITHUB_TOKEN       GitHub token for the release lookup, to stay clear of the API
+#                             rate limit (default: none). Sent as a bearer token only to
+#                             https://api.github.com/, never with the asset downloads.
 #
 # curl enforces https on redirects too. wget enforces https only on the start URL,
 # not on redirects.
@@ -37,12 +40,21 @@ cleanup() {
 }
 
 download() {
+  url=$1
+  out=$2
+  hint=${3:-}
+  auth_token=
+  case $url in
+    https://api.github.com/*) auth_token=${CANARY_GITHUB_TOKEN:-} ;;
+  esac
   if have curl; then
-    curl -fsSL --proto "$proto" --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --retry 2 -o "$2" "$1" ||
-      die "download failed: $1${3:+. $3}"
+    set -- curl -fsSL --proto "$proto" --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --retry 2 -o "$out"
+    [ -z "$auth_token" ] || set -- "$@" -H "Authorization: Bearer $auth_token"
   else
-    wget -q -T 15 --https-only -O "$2" "$1" || die "download failed: $1${3:+. $3}"
+    set -- wget -q -T 15 --https-only -O "$out"
+    [ -z "$auth_token" ] || set -- "$@" "--header=Authorization: Bearer $auth_token"
   fi
+  "$@" "$url" || die "download failed: $url${hint:+. $hint}"
 }
 
 sha256_of() {

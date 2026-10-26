@@ -1,0 +1,79 @@
+name: Install canary
+description: Installs the canary CLI from a GitHub release, verifies its SHA-256 and adds it to PATH. On Linux and macOS it needs curl, or a wget that supports --https-only (a busybox wget does not), so minimal container images must install one first.
+author: m10rten
+
+inputs:
+  version:
+    description: Release tag to install, like v0.1.1. Takes precedence over track. Default is the newest release on the track.
+    required: false
+    default: ''
+  track:
+    description: stable, nightly, alpha, beta or rc. Installs the newest release on that track's upgrade path, as install.sh does.
+    required: false
+    default: stable
+  install-dir:
+    description: Directory to install into, relative to the workspace if not absolute. Default is $RUNNER_TEMP/canary/bin.
+    required: false
+    default: ''
+  token:
+    description: GitHub token for the release lookup, to stay clear of the API rate limit. It is not used for downloads.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: The installed release tag.
+    value: ${{ steps.unix.outputs.version || steps.windows.outputs.version }}
+  path:
+    description: Absolute path of the installed canary executable.
+    value: ${{ steps.unix.outputs.path || steps.windows.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install canary (Linux and macOS)
+      id: unix
+      if: runner.os != 'Windows'
+      shell: sh
+      run: |
+        set -eu
+        dir=${CANARY_INSTALL_DIR:-$RUNNER_TEMP/canary/bin}
+        case $dir in
+          /*) ;;
+          *) dir=$PWD/$dir ;;
+        esac
+        dir=${dir%/}
+        # The directory is on PATH for install.sh so it does not warn about it. Later steps get it through GITHUB_PATH.
+        CANARY_INSTALL_DIR=$dir PATH="$dir:$PATH" sh "$GITHUB_ACTION_PATH/install.sh"
+        version=$("$dir/canary" version | awk 'NR == 1 { print $2 }')
+        [ -n "$version" ] || { echo "::error::could not read the version from $dir/canary"; exit 1; }
+        echo "$dir" >> "$GITHUB_PATH"
+        { echo "version=$version"; echo "path=$dir/canary"; } >> "$GITHUB_OUTPUT"
+      env:
+        CANARY_VERSION: ${{ inputs.version }}
+        CANARY_TRACK: ${{ inputs.track }}
+        CANARY_INSTALL_DIR: ${{ inputs.install-dir }}
+        CANARY_GITHUB_TOKEN: ${{ inputs.token }}
+        CANARY_NO_MODIFY_PATH: '1'
+    - name: Install canary (Windows)
+      id: windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $dir = if ($env:CANARY_INSTALL_DIR) { $env:CANARY_INSTALL_DIR } else { Join-Path $env:RUNNER_TEMP 'canary\bin' }
+        if (-not [IO.Path]::IsPathRooted($dir)) { $dir = Join-Path (Get-Location).Path $dir }
+        $dir = [IO.Path]::GetFullPath($dir).TrimEnd('\', '/')
+        $env:CANARY_INSTALL_DIR = $dir
+        & "$env:GITHUB_ACTION_PATH\install.ps1"
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        $version = ((& "$dir\canary.exe" version | Select-Object -First 1) -split ' ')[1]
+        if (-not $version) { throw "could not read the version from $dir\canary.exe" }
+        # AppendAllText writes no byte order mark, which Windows PowerShell 5.1's Add-Content -Encoding utf8 does.
+        [IO.File]::AppendAllText($env:GITHUB_PATH, "$dir`n")
+        [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$version`npath=$dir\canary.exe`n")
+      env:
+        CANARY_VERSION: ${{ inputs.version }}
+        CANARY_TRACK: ${{ inputs.track }}
+        CANARY_INSTALL_DIR: ${{ inputs.install-dir }}
+        CANARY_GITHUB_TOKEN: ${{ inputs.token }}
+        CANARY_NO_MODIFY_PATH: '1'
