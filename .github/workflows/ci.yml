@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CI_TAG: v0.0.0-ci
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -50,7 +53,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: make dist VERSION=v0.0.0-ci
+      - run: make dist VERSION="$CI_TAG"
       - name: Verify checksums
         working-directory: dist
         run: |
@@ -63,6 +66,169 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 7
+
+  # Builds its own dist/ with a stable-looking version, because the generator
+  # only accepts stable tags. The formula points at the local archives.
+  homebrew:
+    name: homebrew (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: v0.0.0
+      BASE_URL: file://${{ github.workspace }}/dist
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install from a local tap
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          if ! command -v brew >/dev/null 2>&1; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+
+          make dist VERSION="$TAG"
+          make -s release-packages
+
+          brew tap-new --no-git local/canary
+          cp dist/packages/homebrew/canary.rb "$(brew --repository local/canary)/Formula/canary.rb"
+          brew install local/canary/canary
+
+          for name in canary go-canary-cli; do
+            line=$("$(brew --prefix)/bin/$name" --version)
+            echo "$name: $line"
+            case "$line" in
+              "canary $TAG (commit "*) ;;
+              *) fail "$name printed an unexpected version line" ;;
+            esac
+
+            info=$("$(brew --prefix)/bin/$name" info --json)
+            echo "$info"
+            case "$info" in
+              *'"channel":"homebrew"'*) ;;
+              *) fail "$name info --json did not report channel homebrew" ;;
+            esac
+            case "$info" in
+              *'"version":"'"$TAG"'"'*) ;;
+              *) fail "$name info --json did not report version $TAG" ;;
+            esac
+          done
+
+          brew test canary
+
+  # The generator renders every package, so it needs all six archives, which only
+  # the Linux runner can build. v0.0.0 because the generator accepts stable tags only.
+  chocolatey-dist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TAG: v0.0.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make dist VERSION="$TAG"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-chocolatey
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  chocolatey:
+    name: chocolatey (${{ matrix.os }})
+    needs: chocolatey-dist
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: amd64
+          - os: windows-11-arm
+            arch: arm64
+    env:
+      TAG: v0.0.0
+      WANT_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-chocolatey
+          path: dist
+      # The generator runs directly because the Windows runners have no make.
+      - name: Pack with the downloads served from the local dist
+        run: |
+          $baseUrl = ([System.Uri](Resolve-Path dist).Path).AbsoluteUri
+          go run ./cmd/packaging $env:TAG dist/checksums.txt dist/packages $baseUrl
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::packaging failed"; exit 1 }
+          Push-Location dist/packages/chocolatey
+          choco pack
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::choco pack failed"; exit 1 }
+          Pop-Location
+      - name: Install from the local package
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          choco install m10rten-canary --source "$PWD\dist\packages\chocolatey" --version $version --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::choco install failed"; exit 1 }
+      - name: Both names, info and upgrade hint
+        run: |
+          function Fail($message) { Write-Host "::error::$message"; exit 1 }
+          $bin = Join-Path $env:ChocolateyInstall 'bin'
+          $libDir = Join-Path $env:ChocolateyInstall 'lib\m10rten-canary\'
+
+          foreach ($name in 'canary', 'go-canary-cli') {
+            $exe = Join-Path $bin "$name.exe"
+
+            $line = & $exe --version
+            Write-Host "${name}: $line"
+            if ($line -notlike "canary $env:TAG (commit *, windows/$env:WANT_ARCH)") { Fail "$name printed an unexpected version line" }
+
+            $json = & $exe info --json
+            Write-Host $json
+            $info = $json | ConvertFrom-Json
+            if ($info.channel -ne 'chocolatey') { Fail "$name info --json did not report channel chocolatey" }
+            if ($info.version -ne $env:TAG) { Fail "$name info --json did not report version $env:TAG" }
+            if (-not $info.path.StartsWith($libDir, [System.StringComparison]::OrdinalIgnoreCase)) { Fail "$name info --json did not report a path under $libDir" }
+          }
+
+          $upgrade = & (Join-Path $bin 'canary.exe') upgrade
+          if ($LASTEXITCODE -ne 0) { Fail "canary upgrade exited $LASTEXITCODE, not 0" }
+          Write-Host ($upgrade -join "`n")
+          if ($upgrade -notcontains '  choco upgrade m10rten-canary') { Fail 'canary upgrade did not print the choco upgrade command' }
+      - name: Uninstall removes both shims
+        run: |
+          function Fail($message) { Write-Host "::error::$message"; exit 1 }
+          choco uninstall m10rten-canary --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { Fail 'choco uninstall failed' }
+          foreach ($name in 'canary', 'go-canary-cli') {
+            if (Test-Path (Join-Path $env:ChocolateyInstall "bin\$name.exe")) { Fail "the $name shim is still there after uninstall" }
+          }
+          if (Test-Path (Join-Path $env:ChocolateyInstall 'lib\m10rten-canary')) { Fail 'the package folder is still there after uninstall' }
 
   install-sh:
     name: install.sh (${{ matrix.os }})
@@ -77,7 +243,6 @@ jobs:
       run:
         shell: bash
     env:
-      CI_TAG: v0.0.0-ci
       CANARY_DOWNLOAD_BASE_URL: file://${{ github.workspace }}/mirror
       # Keeps the other steps from editing the runner's shell profiles. The profile step unsets it.
       CANARY_NO_MODIFY_PATH: 1
@@ -564,3 +729,282 @@ jobs:
           if install_track CANARY_TRACK=Nightly; then fail "an unknown track installed"; fi
           cat "$stub/err"
           grep -qF "CANARY_TRACK must be one of stable, nightly, alpha, beta or rc, got: Nightly" "$stub/err" || fail "unexpected unknown-track message"
+
+  # Packs the npm package once, so the install jobs test the exact tarball and
+  # only the runners that install it need Node, not Go or make.
+  npm-package:
+    needs: dist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Unit tests, with the archives from make dist
+        env:
+          CANARY_DIST_DIR: ${{ github.workspace }}/dist
+        run: node --test "test/npm/*.test.js"
+      - name: No package.json is checked in
+        run: |
+          tracked=$(git ls-files ':(glob)**/package.json')
+          if [ -n "$tracked" ]; then
+            echo "::error::package.json is generated at publish time. Checked in: $tracked"
+            exit 1
+          fi
+      - name: Stage and pack
+        run: |
+          set -euo pipefail
+          TAG="$CI_TAG" make -s release-npm-package
+          mkdir pack
+          tarball=$(npm pack ./bin/npm --pack-destination pack --silent)
+          ls pack
+          want=$(printf 'package/%s\n' LICENSE README.md install.js launcher.js package.json)
+          got=$(tar -tzf "pack/$tarball" | LC_ALL=C sort)
+          if [ "$got" != "$want" ]; then
+            echo "::error::The tarball holds the wrong files:"
+            echo "$got"
+            exit 1
+          fi
+      - name: A rejected tag fails and leaves no package
+        run: |
+          if TAG=bogus make -s release-npm-package; then
+            echo "::error::make accepted TAG=bogus"
+            exit 1
+          fi
+          if [ -e bin/npm/package.json ]; then
+            echo "::error::A rejected tag left bin/npm/package.json behind"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tarball
+          path: pack/
+          if-no-files-found: error
+          retention-days: 7
+
+  npm:
+    name: npm (${{ matrix.os }})
+    needs: [dist, npm-package]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-tarball
+          path: npm-tarball
+      # A file URL from Node, because file://${{ github.workspace }} is not valid with Windows paths.
+      - name: Stage release mirror
+        run: |
+          mkdir -p "mirror/$CI_TAG"
+          cp dist/* "mirror/$CI_TAG/"
+          url=$(node -p "require('node:url').pathToFileURL(require('node:path').resolve('mirror')).href")
+          echo "CANARY_DOWNLOAD_BASE_URL=$url" >> "$GITHUB_ENV"
+          echo "TARBALL=./npm-tarball/m10rten-go-canary-cli-${CI_TAG#v}.tgz" >> "$GITHUB_ENV"
+      - name: Install from the tarball
+        run: npm install -g --prefix "$RUNNER_TEMP/npm-global" "$TARBALL"
+      - name: Both names, info, upgrade hint and exit codes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          prefix="$RUNNER_TEMP/npm-global"
+          if [ "$RUNNER_OS" = Windows ]; then PATH="$(cygpath -u "$prefix"):$PATH"; else PATH="$prefix/bin:$PATH"; fi
+          want_os=$(node -p "({ darwin: 'darwin', linux: 'linux', win32: 'windows' })[process.platform]")
+          want_arch=$(node -p "({ x64: 'amd64', arm64: 'arm64' })[process.arch]")
+
+          for name in canary go-canary-cli; do
+            line=$("$name" --version)
+            echo "$name: $line"
+            case "$line" in
+              "canary $CI_TAG (commit "*", $want_os/$want_arch)") ;;
+              *) fail "$name printed an unexpected version line" ;;
+            esac
+
+            info=$("$name" info --json)
+            echo "$info"
+            case "$info" in
+              *'"channel":"npm"'*) ;;
+              *) fail "$name info --json did not report channel npm" ;;
+            esac
+            case "$info" in
+              *node_modules*) ;;
+              *) fail "$name info --json did not report a path under node_modules" ;;
+            esac
+            case "$info" in
+              *'"version":"'"$CI_TAG"'"'*) ;;
+              *) fail "$name info --json did not report version $CI_TAG" ;;
+            esac
+          done
+
+          upgrade=$(canary upgrade)
+          echo "$upgrade"
+          printf '%s\n' "$upgrade" | grep -qxF "  npm install -g @m10rten/go-canary-cli@latest" ||
+            fail "canary upgrade did not print the npm install command"
+
+          rc=0
+          canary --version >/dev/null || rc=$?
+          [ "$rc" -eq 0 ] || fail "canary --version exited $rc, not 0"
+
+          # The launcher and the CLI both use 2 for errors. Only the CLI exits 1, when an update is available.
+          rc=0
+          out=$(canary check 2>&1) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 1 ] || fail "canary check exited $rc, not 1"
+          printf '%s\n' "$out" | grep -qF "Update available: $CI_TAG" || fail "canary check did not report an update"
+      - name: A bad checksum fails the install and leaves no binary
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          mirror="$RUNNER_TEMP/bad-mirror"
+          mkdir -p "$mirror/$CI_TAG"
+          cp dist/* "$mirror/$CI_TAG/"
+          awk '{ $1 = sprintf("%064d", 0); print $1 "  " $2 }' dist/checksums.txt >"$mirror/$CI_TAG/checksums.txt"
+          bad_url=$(node -p "require('node:url').pathToFileURL(process.argv[1]).href" "$mirror")
+
+          prefix="$RUNNER_TEMP/npm-tampered"
+          if CANARY_DOWNLOAD_BASE_URL="$bad_url" npm install -g --prefix "$prefix" "$TARBALL" >"$RUNNER_TEMP/tampered.log" 2>&1; then
+            fail "the install succeeded with wrong checksums"
+          fi
+          cat "$RUNNER_TEMP/tampered.log"
+          grep -qF "checksum mismatch" "$RUNNER_TEMP/tampered.log" || fail "unexpected error message"
+          vendor="$(npm root -g --prefix "$prefix")/@m10rten/go-canary-cli/vendor"
+          if node -e "process.exit(require('node:fs').existsSync(process.argv[1]) ? 0 : 1)" "$vendor"; then
+            fail "a failed install left $vendor behind"
+          fi
+      - name: Without install scripts the launcher prints the fix, and the fix works
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          prefix="$RUNNER_TEMP/npm-noscripts"
+          npm install -g --ignore-scripts --prefix "$prefix" "$TARBALL"
+          launcher="$(npm root -g --prefix "$prefix")/@m10rten/go-canary-cli/launcher.js"
+
+          rc=0
+          out=$(node "$launcher" --version 2>&1) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 2 ] || fail "the launcher exited $rc, not 2, without the binary"
+          fix=$(printf '%s\n' "$out" | sed -n '/To install it, run:/{n;p;}' | sed 's/^  //')
+          [ -n "$fix" ] || fail "the launcher did not print a fix command"
+          eval "$fix"
+
+          if [ "$RUNNER_OS" = Windows ]; then PATH="$(cygpath -u "$prefix"):$PATH"; else PATH="$prefix/bin:$PATH"; fi
+          for name in canary go-canary-cli; do
+            case "$("$name" --version)" in
+              "canary $CI_TAG (commit "*) ;;
+              *) fail "$name did not work after the printed fix" ;;
+            esac
+          done
+
+  # pnpm 10 and later skip dependency install scripts until they are approved.
+  pnpm:
+    name: pnpm ${{ matrix.pnpm }} (${{ matrix.os }})
+    needs: [dist, npm-package]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+        pnpm: ['10', '12']
+    defaults:
+      run:
+        shell: bash
+    env:
+      PNPM_VERSION: ${{ matrix.pnpm }}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-tarball
+          path: npm-tarball
+      - name: Stage release mirror and install pnpm
+        run: |
+          mkdir -p "mirror/$CI_TAG"
+          cp dist/* "mirror/$CI_TAG/"
+          url=$(node -p "require('node:url').pathToFileURL(require('node:path').resolve('mirror')).href")
+          echo "CANARY_DOWNLOAD_BASE_URL=$url" >> "$GITHUB_ENV"
+          echo "TARBALL=./npm-tarball/m10rten-go-canary-cli-${CI_TAG#v}.tgz" >> "$GITHUB_ENV"
+          npm install -g "pnpm@$PNPM_VERSION"
+          pnpm --version
+      - name: pnpm skips the install script, the printed fix repairs it
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          export PNPM_HOME="$RUNNER_TEMP/pnpm-fix"
+          mkdir -p "$PNPM_HOME"
+          home=$PNPM_HOME
+          if [ "$RUNNER_OS" = Windows ]; then home=$(cygpath -u "$PNPM_HOME"); fi
+          # pnpm 10 links global bins into PNPM_HOME, later versions into PNPM_HOME/bin.
+          PATH="$home:$home/bin:$PATH"
+
+          pnpm add -g "$TARBALL" 2>&1 | tee "$RUNNER_TEMP/pnpm-add.log"
+          grep -qF "Ignored build scripts" "$RUNNER_TEMP/pnpm-add.log" || fail "pnpm did not report the skipped install script"
+
+          rc=0
+          out=$(canary --version 2>&1) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 2 ] || fail "the launcher exited $rc, not 2, without the binary"
+          fix=$(printf '%s\n' "$out" | sed -n '/To install it, run:/{n;p;}' | sed 's/^  //')
+          [ -n "$fix" ] || fail "the launcher did not print a fix command"
+          eval "$fix"
+
+          for name in canary go-canary-cli; do
+            case "$("$name" --version)" in
+              "canary $CI_TAG (commit "*) ;;
+              *) fail "$name did not work after the printed fix" ;;
+            esac
+            case "$("$name" info --json)" in
+              *'"channel":"npm"'*) ;;
+              *) fail "$name info --json did not report channel npm" ;;
+            esac
+          done
+      # Runs on pnpm 12 only: approve-builds -g --all runs the script of the global install.
+      - name: pnpm approve-builds runs the install script
+        if: matrix.pnpm == '12'
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          export PNPM_HOME="$RUNNER_TEMP/pnpm-approve"
+          mkdir -p "$PNPM_HOME"
+          home=$PNPM_HOME
+          if [ "$RUNNER_OS" = Windows ]; then home=$(cygpath -u "$PNPM_HOME"); fi
+          PATH="$home:$home/bin:$PATH"
+
+          pnpm add -g "$TARBALL"
+          pnpm approve-builds -g --all
+          for name in canary go-canary-cli; do
+            case "$("$name" --version)" in
+              "canary $CI_TAG (commit "*) ;;
+              *) fail "$name did not work after pnpm approve-builds" ;;
+            esac
+          done

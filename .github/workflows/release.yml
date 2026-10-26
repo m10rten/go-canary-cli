@@ -3,13 +3,11 @@ name: Release
 on:
   push:
     tags: ['v*']
-  schedule:
-    - cron: '17 3 * * *'
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      keep:
-        description: Nightly releases to keep (default 14, lower it only to test retention)
-        required: false
+      tag:
+        description: Existing nightly tag to release, created by nightly.yml
+        required: true
         type: string
 
 permissions:
@@ -30,7 +28,6 @@ jobs:
       prerelease: ${{ steps.tag.outputs.prerelease || steps.nightly.outputs.prerelease }}
       dist_tag: ${{ steps.tag.outputs.dist_tag || steps.nightly.outputs.dist_tag }}
       commit: ${{ steps.tag.outputs.commit || steps.nightly.outputs.commit }}
-      create_tag: ${{ steps.nightly.outputs.create_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,64 +68,32 @@ jobs:
             echo "::error::Release $TAG is already published. \"Re-run all jobs\" would rebuild different bytes. Use \"Re-run failed jobs\" on the original run to recover."
             exit 1
           fi
-      - name: Resolve nightly
+      - name: Resolve called tag
         id: nightly
+        # In a called workflow event_name is the caller's event (schedule/workflow_dispatch), never workflow_call.
         if: github.event_name != 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          REF: ${{ github.ref }}
-          SHA: ${{ github.sha }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -eu
           fail() { echo "::error::$1"; exit 1; }
-          field() { printf '%s\n' "$plan" | sed -n "s/^$1=//p"; }
-          has_line() { printf '%s\n' "$2" | awk -v want="$1" '$0 == want { found = 1 } END { exit !found }'; }
-
-          [ "$REF" = refs/heads/main ] || fail "Nightly releases run from main only, not $REF."
-          main_head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha) ||
-            fail "Could not read the head of main."
-          [ "$main_head" = "$SHA" ] ||
-            fail "This run is for $SHA, but main is at $main_head. Re-runs of old runs are not allowed."
-
-          refs=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref')
-          tags=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||')
-          NIGHTLY_DATE=$(date -u +%Y%m%d)
-          export NIGHTLY_DATE
-          plan=$(printf '%s\n' "$tags" | make -s release-next-nightly) ||
-            fail "Could not derive the next nightly tag."
-          tag=$(field tag)
-          newest=$(field newest)
-          exists=$(field exists)
-          [ -n "$tag" ] || fail "The nightly tag derivation printed no tag."
-
-          create_tag=true
-          if [ -n "$newest" ]; then
-            newest_commit=$(gh api "repos/$GH_REPO/commits/$newest" --jq .sha)
-            if [ "$exists" = true ] && [ "$newest_commit" != "$SHA" ]; then
-              fail "Nightly $tag already exists on commit $newest_commit, but main is at $SHA. There is one nightly per UTC day. Wait for tomorrow's run, or delete the release and tag $tag to build it again from main."
-            fi
-            if [ "$newest_commit" = "$SHA" ]; then
-              published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false) | .tag_name')
-              if has_line "$newest" "$published"; then
-                echo "::notice::No changes on main since $newest. No nightly this run."
-                echo "publish=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              echo "::notice::Resuming $newest, which has no published release."
-              tag=$newest
-              create_tag=false
-            fi
-          fi
-
+          case "$TAG" in
+            v*-nightly.*) ;;
+            *) fail "Tag '$TAG' is not a nightly tag. Only nightly.yml calls this workflow." ;;
+          esac
+          found=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha') ||
+            fail "Could not look up tag $TAG."
+          [ "${found%% *}" = commit ] ||
+            fail "Tag $TAG is a ${found%% *} object, not a lightweight tag."
           {
             echo "publish=true"
-            echo "tag=$tag"
+            echo "tag=$TAG"
             echo "track=nightly"
             echo "prerelease=true"
             echo "dist_tag=nightly"
-            echo "commit=$SHA"
-            echo "create_tag=$create_tag"
+            echo "commit=${found#* }"
           } >> "$GITHUB_OUTPUT"
 
   build:
@@ -195,32 +160,6 @@ jobs:
         with:
           name: dist
           path: dist
-      - name: Verify or create the nightly tag
-        if: needs.resolve.outputs.track == 'nightly'
-        env:
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-          CREATE_TAG: ${{ needs.resolve.outputs.create_tag }}
-        run: |
-          set -eu
-          fail() { echo "::error::$1"; exit 1; }
-          err=$(mktemp)
-          if found=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha' 2>"$err"); then
-            type=${found%% *}
-            sha=${found#* }
-            [ "$type" = commit ] ||
-              fail "Tag $TAG is a $type object, not a lightweight tag. Refusing to compare it to commit $COMMIT."
-            [ "$sha" = "$COMMIT" ] ||
-              fail "Tag $TAG points to $sha, not $COMMIT. The tag was moved after it was resolved."
-            echo "Tag $TAG already points to $COMMIT."
-            exit 0
-          fi
-          grep -q 'HTTP 404' "$err" || {
-            cat "$err" >&2
-            fail "Could not look up tag $TAG."
-          }
-          [ "$CREATE_TAG" = true ] || fail "Tag $TAG is missing, but it was expected on $COMMIT."
-          gh api -X POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$COMMIT" --silent
-          echo "Created tag $TAG on $COMMIT."
       - name: Create or complete the release
         run: |
           set -euo pipefail
@@ -318,56 +257,222 @@ jobs:
             fail "Release $TAG does not have the prerelease flag $PRERELEASE"
           echo "Release $TAG is published with all ${#expected[@]} assets."
 
-  prune-nightlies:
+  publish-homebrew:
     needs: [resolve, release]
-    if: needs.resolve.outputs.track == 'nightly'
+    if: needs.resolve.outputs.track == 'stable'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    permissions:
-      contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.resolve.outputs.commit }}
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
-      - name: Delete nightlies beyond the keep count
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Render the formula
+        run: make -s release-packages
+      - name: Push the formula to the tap
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          KEEP: ${{ inputs.keep }}
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
-          set -eu
-          fail() { echo "::error::$1"; exit 1; }
-          has_line() { printf '%s\n' "$2" | awk -v want="$1" '$0 == want { found = 1 } END { exit !found }'; }
+          set -euo pipefail
+          version=${TAG#v}
 
-          keep=${KEEP:-14}
-          case "$keep" in *[!0-9]*) fail "The keep count must be a whole number, got '$keep'." ;; esac
-          [ "$keep" -ge 1 ] || fail "The keep count must be 1 or more, got '$keep'."
+          ruby -c dist/packages/homebrew/canary.rb
 
-          refs=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref')
-          tags=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||')
-          doomed=$(printf '%s\n' "$tags" | KEEP="$keep" make -s release-prune-nightlies) ||
-            fail "Could not select the nightlies to delete."
-          if [ -z "$doomed" ]; then
-            echo "No nightlies beyond the newest $keep."
+          umask 077
+          key="$RUNNER_TEMP/tap_deploy_key"
+          known_hosts="$RUNNER_TEMP/known_hosts"
+          [ -n "$TAP_DEPLOY_KEY" ] || { echo "::error::HOMEBREW_TAP_DEPLOY_KEY is not set"; exit 1; }
+          printf '%s\n' "$TAP_DEPLOY_KEY" | tr -d '\r' > "$key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known_hosts -o StrictHostKeyChecking=yes"
+
+          git clone --depth 1 --branch main git@github.com:m10rten/homebrew-tap.git tap
+          if grep -qx "  version \"$version\"" tap/Formula/canary.rb 2>/dev/null; then
+            echo "The tap already has canary $version. Nothing to push."
             exit 0
           fi
 
-          releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name')
-          while read -r tag; do
-            case "$tag" in
-              v*-nightly.*) ;;
-              *) fail "Refusing to delete $tag, it is not a nightly tag." ;;
-            esac
-            if has_line "$tag" "$releases"; then
-              gh release delete "$tag" --yes
+          mkdir -p tap/Formula
+          cp dist/packages/homebrew/canary.rb tap/Formula/canary.rb
+          git -C tap add Formula/canary.rb
+          git -C tap -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "canary $version"
+          git -C tap push origin HEAD:refs/heads/main
+
+  # Runs for every track. npm trusted publishing (OIDC) replaces a stored token, so
+  # id-token: write is granted to this job only. The package is installed by the
+  # postinstall script from the GitHub release, which the release job has made public.
+  publish-npm:
+    needs: [resolve, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      DIST_TAG: ${{ needs.resolve.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      # Node 24 satisfies the Node 22.14.0 floor of trusted publishing. Its npm is checked below.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      # Node 24 bundles npm 11.19.1, but `npm dist-tag` over OIDC needs npm 11.21.0 or later.
+      - name: Install npm and check Node and npm versions
+        env:
+          NPM_VERSION: '11.21.1'
+        run: |
+          set -eu
+          npm install -g "npm@$NPM_VERSION"
+          node --version
+          npm --version
+          oldest=$(printf '%s\n%s\n' 11.21.0 "$(npm --version)" | sort -V | head -n 1)
+          if [ "$oldest" != 11.21.0 ]; then
+            echo "::error::npm $(npm --version) is older than 11.21.0, which npm dist-tag over trusted publishing needs."
+            exit 1
+          fi
+      - name: Stage the package
+        run: make -s release-npm-package
+      - name: Publish unless this version is already on npm
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          name=$(node -p "require('./bin/npm/package.json').name")
+          version=$(node -p "require('./bin/npm/package.json').version")
+          err=$(mktemp)
+          if found=$(npm view "$name@$version" version 2>"$err"); then
+            [ "$found" = "$version" ] || fail "npm view $name@$version printed '$found'."
+            echo "$name@$version is already on npm. Nothing to publish."
+          else
+            grep -q 'npm error code E404' "$err" || {
+              cat "$err" >&2
+              fail "Could not look up $name@$version on npm."
+            }
+            npm publish ./bin/npm --tag "$DIST_TAG"
+          fi
+      - name: Reconcile dist-tags
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          name=$(node -p "require('./bin/npm/package.json').name")
+          version=$(node -p "require('./bin/npm/package.json').version")
+
+          # The registry can serve a cached package page for a moment after a publish.
+          seen=false
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if view=$(npm view "$name" versions dist-tags --json 2>/dev/null) &&
+              printf '%s' "$view" | node -e "const { versions } = JSON.parse(require('node:fs').readFileSync(0, 'utf8')); process.exit([].concat(versions).includes(process.argv[1]) ? 0 : 1)" "$version"; then
+              seen=true
+              break
             fi
-            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" --silent
-            echo "Deleted nightly $tag."
-          done <<<"$doomed"
+            echo "$name@$version is not in the published versions yet (attempt $attempt)."
+            sleep 6
+          done
+          [ "$seen" = true ] || fail "$name@$version did not show up in the versions on npm."
+
+          changes=$(printf '%s\n' "$view" | make -s release-dist-tags) ||
+            fail "Could not work out the dist-tag changes."
+          if [ -z "$changes" ]; then
+            echo "The dist-tags are up to date."
+            exit 0
+          fi
+          while read -r tag target; do
+            npm dist-tag add "$name@$target" "$tag" </dev/null
+          done <<<"$changes"
+
+  # Stable releases only. The package installs from the public release archives, so it
+  # runs after the release job. A version already on the community feed, or a 409 from the
+  # push (a version still in moderation), counts as published.
+  publish-chocolatey:
+    needs: [resolve, release]
+    if: needs.resolve.outputs.track == 'stable'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Require the API key
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          if (-not $env:CHOCOLATEY_API_KEY) {
+            Write-Host "::error::CHOCOLATEY_API_KEY is not set"
+            exit 1
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      # The generator runs directly because the Windows runner has no make. Bash passes its empty BASE_URL argument intact.
+      - name: Render and pack the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/packaging "$TAG" dist/checksums.txt dist/packages ""
+          cd dist/packages/chocolatey
+          choco pack
+      - name: Install the package locally
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          choco install m10rten-canary --source "$PWD\dist\packages\chocolatey" --version $version --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::choco install failed"; exit 1 }
+          $line = & "$env:ChocolateyInstall\bin\canary.exe" --version
+          Write-Host $line
+          if ($line -notlike "canary $env:TAG (commit *") {
+            Write-Host "::error::canary --version printed an unexpected line: $line"
+            exit 1
+          }
+      - name: Push unless this version is already on the community feed
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          $version = $env:TAG.TrimStart('v')
+
+          # A failed search is not fatal: the push answers 409 for a version that exists.
+          $listed = @(choco search m10rten-canary --exact --all-versions --limit-output --source https://community.chocolatey.org/api/v2/)
+          if ($listed -contains "m10rten-canary|$version") {
+            Write-Host "m10rten-canary $version is already on the community feed. Nothing to push."
+            exit 0
+          }
+
+          $output = (& choco push "dist\packages\chocolatey\m10rten-canary.$version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          Write-Host $output
+          if ($code -eq 0) { exit 0 }
+          if ($output -match '\(409\)|\b409 \(?Conflict') {
+            Write-Host "m10rten-canary $version was already pushed (HTTP 409). Nothing to push."
+            exit 0
+          }
+          Write-Host "::error::choco push failed with exit code $code"
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Channel hook points (placeholders, not jobs). Each job below must declare
@@ -376,10 +481,7 @@ jobs:
   # Read the tag, track and dist_tag from needs.resolve.outputs and add
   # `resolve` to needs. Gate Homebrew and Chocolatey on track == 'stable'.
   #
-  # publish-npm        (task 5): needs: release, permissions: id-token: write
-  # publish-homebrew   (task 4): needs: release
-  # publish-chocolatey (task 6): needs: release
-  # smoke              (task 7): needs: [release, publish-npm, publish-homebrew,
+  # smoke              (task 7): needs: [release, publish-npm,
   #                              publish-chocolatey], calls the reusable smoke
   #                              workflow with from = previous release and
   #                              to = needs.resolve.outputs.tag
