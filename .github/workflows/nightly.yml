@@ -1,0 +1,157 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: Nightly releases to keep (default 14, lower it only to test retention)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      publish: ${{ steps.nightly.outputs.publish }}
+      tag: ${{ steps.nightly.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Resolve nightly
+        id: nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          fail() { echo "::error::$1"; exit 1; }
+          field() { printf '%s\n' "$plan" | sed -n "s/^$1=//p"; }
+          has_line() { printf '%s\n' "$2" | awk -v want="$1" '$0 == want { found = 1 } END { exit !found }'; }
+
+          [ "$REF" = refs/heads/main ] || fail "Nightly releases run from main only, not $REF."
+          main_head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha) ||
+            fail "Could not read the head of main."
+          [ "$main_head" = "$SHA" ] ||
+            fail "This run is for $SHA, but main is at $main_head. Re-runs of old runs are not allowed."
+
+          refs=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref')
+          tags=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||')
+          NIGHTLY_DATE=$(date -u +%Y%m%d)
+          export NIGHTLY_DATE
+          plan=$(printf '%s\n' "$tags" | make -s release-next-nightly) ||
+            fail "Could not derive the next nightly tag."
+          tag=$(field tag)
+          newest=$(field newest)
+          exists=$(field exists)
+          [ -n "$tag" ] || fail "The nightly tag derivation printed no tag."
+
+          create_tag=true
+          if [ -n "$newest" ]; then
+            newest_commit=$(gh api "repos/$GH_REPO/commits/$newest" --jq .sha)
+            if [ "$exists" = true ] && [ "$newest_commit" != "$SHA" ]; then
+              fail "Nightly $tag already exists on commit $newest_commit, but main is at $SHA. There is one nightly per UTC day. Wait for tomorrow's run, or delete the release and tag $tag to build it again from main."
+            fi
+            if [ "$newest_commit" = "$SHA" ]; then
+              published=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false) | .tag_name')
+              if has_line "$newest" "$published"; then
+                echo "::notice::No changes on main since $newest. No nightly this run."
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::notice::Resuming $newest, which has no published release."
+              tag=$newest
+              create_tag=false
+            fi
+          fi
+
+          if [ "$create_tag" = true ]; then
+            gh api -X POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$SHA" --silent
+            echo "Created tag $tag on $SHA."
+          fi
+
+          {
+            echo "publish=true"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  # The tag is created with GITHUB_TOKEN, which does not start a push run of release.yml.
+  # Calling it here is what releases the nightly.
+  release:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+
+  prune-nightlies:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Delete nightlies beyond the keep count
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KEEP: ${{ inputs.keep }}
+        run: |
+          set -eu
+          fail() { echo "::error::$1"; exit 1; }
+          has_line() { printf '%s\n' "$2" | awk -v want="$1" '$0 == want { found = 1 } END { exit !found }'; }
+
+          keep=${KEEP:-14}
+          case "$keep" in *[!0-9]*) fail "The keep count must be a whole number, got '$keep'." ;; esac
+          [ "$keep" -ge 1 ] || fail "The keep count must be 1 or more, got '$keep'."
+
+          refs=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref')
+          tags=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||')
+          doomed=$(printf '%s\n' "$tags" | KEEP="$keep" make -s release-prune-nightlies) ||
+            fail "Could not select the nightlies to delete."
+          if [ -z "$doomed" ]; then
+            echo "No nightlies beyond the newest $keep."
+            exit 0
+          fi
+
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name')
+          while read -r tag; do
+            case "$tag" in
+              v*-nightly.*) ;;
+              *) fail "Refusing to delete $tag, it is not a nightly tag." ;;
+            esac
+            if has_line "$tag" "$releases"; then
+              gh release delete "$tag" --yes
+            fi
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" --silent
+            echo "Deleted nightly $tag."
+          done <<<"$doomed"
