@@ -19,7 +19,8 @@ const usage = `usage:
   releasetool classify TAG                  validate a pushed tag
   releasetool next-nightly YYYYMMDD         release tags on stdin, one per line
   releasetool prune-nightlies KEEP          release tags on stdin, one per line
-  releasetool dist-tags                     JSON from "npm view PKG versions dist-tags --json" on stdin`
+  releasetool dist-tags                     JSON from "npm view PKG versions dist-tags --json" on stdin
+  releasetool npm-package TAG               print the npm package.json for a tag`
 
 type command struct {
 	arity int
@@ -31,6 +32,7 @@ var commands = map[string]command{
 	"next-nightly":    {1, func(a []string, in io.Reader) (string, error) { return nextNightly(a[0], in) }},
 	"prune-nightlies": {1, func(a []string, in io.Reader) (string, error) { return pruneNightlies(a[0], in) }},
 	"dist-tags":       {0, func(_ []string, in io.Reader) (string, error) { return distTags(in) }},
+	"npm-package":     {1, func(a []string, _ io.Reader) (string, error) { return npmPackage(a[0]) }},
 }
 
 // Run executes one command and returns the process exit code: 0 on success,
