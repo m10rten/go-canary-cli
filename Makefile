@@ -10,7 +10,7 @@ LDFLAGS := -s -w \
 TARGETS      := darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64
 DIST_VERSION  = $(VERSION:v%=%)
 
-.PHONY: build test clean dist release-classify release-next-nightly release-prune-nightlies release-dist-tags
+.PHONY: build test clean dist release-classify release-next-nightly release-prune-nightlies release-dist-tags release-packages release-npm-package release-npm-bootstrap
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/canary ./cmd/canary
@@ -66,3 +66,25 @@ release-prune-nightlies:
 
 release-dist-tags:
 	@go run ./cmd/releasetool dist-tags
+
+# Renders the package manager files for TAG from dist/checksums.txt into
+# dist/packages/. TAG and BASE_URL (optional, tests only, replaces the release
+# download URL) come from the environment, never as `make VAR=...` (make expands $(...) there).
+release-packages:
+	@go run ./cmd/packaging "$$TAG" dist/checksums.txt dist/packages "$$BASE_URL"
+
+# Stages the npm package for TAG in bin/npm/: the checked-in JS, README.md,
+# LICENSE and the generated package.json. TAG comes from the environment, never
+# as `make TAG=...`. A rejected TAG fails and leaves no bin/npm/ behind, so a
+# stale package cannot be published by mistake.
+release-npm-package:
+	@set -e; \
+	rm -rf bin/npm; \
+	manifest=$$(go run ./cmd/releasetool npm-package "$$TAG"); \
+	mkdir -p bin/npm; \
+	cp npm/install.js npm/launcher.js README.md LICENSE bin/npm/; \
+	printf '%s\n' "$$manifest" > bin/npm/package.json
+
+# The one-time bootstrap publish (RELEASING.md): the same package at v0.0.0. It does not publish.
+release-npm-bootstrap: export TAG := v0.0.0
+release-npm-bootstrap: release-npm-package

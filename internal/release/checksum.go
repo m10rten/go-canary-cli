@@ -21,13 +21,9 @@ const sha256HexLen = sha256.Size * 2
 // checksums, the contents of a checksums.txt in sha256sum format. A malformed
 // or duplicated line makes the whole file untrusted.
 func VerifyChecksum(checksums []byte, name string, content io.Reader) error {
-	entries, err := parseChecksums(checksums)
+	want, err := LookupChecksum(checksums, name)
 	if err != nil {
 		return err
-	}
-	want, ok := entries[name]
-	if !ok {
-		return fmt.Errorf("%w for %s", ErrChecksumMissing, name)
 	}
 
 	hash := sha256.New()
@@ -38,6 +34,20 @@ func VerifyChecksum(checksums []byte, name string, content io.Reader) error {
 		return fmt.Errorf("%w for %s: got %s, want %s", ErrChecksumMismatch, name, got, want)
 	}
 	return nil
+}
+
+// LookupChecksum returns the lowercase SHA-256 hex digest listed for name in
+// checksums. A malformed or duplicated line makes the whole file untrusted.
+func LookupChecksum(checksums []byte, name string) (string, error) {
+	entries, err := parseChecksums(checksums)
+	if err != nil {
+		return "", err
+	}
+	digest, ok := entries[name]
+	if !ok {
+		return "", fmt.Errorf("%w for %s", ErrChecksumMissing, name)
+	}
+	return digest, nil
 }
 
 // parseChecksums maps file names to lowercase SHA-256 hex digests. Each line is

@@ -1,0 +1,25 @@
+$ErrorActionPreference = 'Stop'
+
+$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+# PROCESSOR_ARCHITEW6432 is set only in a 32-bit process on 64-bit Windows and then names the OS architecture.
+# An x64 process emulated on ARM64 may report AMD64 in both variables.
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+# RuntimeInformation does not exist before .NET Framework 4.7.1.
+if (-not $arch -and ('System.Runtime.InteropServices.RuntimeInformation' -as [type])) {
+  $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+}
+switch ($arch) {
+  { 'AMD64', 'X64' -contains $_ } {
+    $url = '{{.Amd64.URL}}'
+    $checksum = '{{.Amd64.SHA256}}'
+  }
+  'ARM64' {
+    $url = '{{.Arm64.URL}}'
+    $checksum = '{{.Arm64.SHA256}}'
+  }
+  default { throw "canary supports 64-bit Windows on x64 or ARM64 only, this is '$arch'." }
+}
+
+Install-ChocolateyZipPackage -PackageName $env:ChocolateyPackageName -Url $url -UnzipLocation $toolsDir -Checksum $checksum -ChecksumType 'sha256'
+Install-BinFile -Name 'go-canary-cli' -Path (Join-Path $toolsDir 'canary.exe')

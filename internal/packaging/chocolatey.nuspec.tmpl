@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>{{.ID}}</id>
+    <version>{{.Version}}</version>
+    <title>canary</title>
+    <authors>m10rten</authors>
+    <owners>m10rten</owners>
+    <projectUrl>https://github.com/m10rten/go-canary-cli</projectUrl>
+    <licenseUrl>https://github.com/m10rten/go-canary-cli/blob/{{.Tag}}/LICENSE</licenseUrl>
+    <projectSourceUrl>https://github.com/m10rten/go-canary-cli</projectSourceUrl>
+    <docsUrl>https://github.com/m10rten/go-canary-cli/blob/{{.Tag}}/README.md</docsUrl>
+    <bugTrackerUrl>https://github.com/m10rten/go-canary-cli/issues</bugTrackerUrl>
+    <packageSourceUrl>https://github.com/m10rten/go-canary-cli</packageSourceUrl>
+    <copyright>Copyright (c) 2026 M10rten</copyright>
+    <releaseNotes>https://github.com/m10rten/go-canary-cli/releases/tag/{{.Tag}}</releaseNotes>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <tags>canary cli go</tags>
+    <summary>App for testing Go CLI releases, upgrades and multi-channel distribution</summary>
+    <description>canary is an app for testing Go CLI releases, upgrades and multi-channel distribution. It installs as canary and go-canary-cli.</description>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

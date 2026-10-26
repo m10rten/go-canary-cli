@@ -1,0 +1,38 @@
+class Canary < Formula
+  desc "App for testing Go CLI releases, upgrades and multi-channel distribution"
+  homepage "https://github.com/m10rten/go-canary-cli"
+  version "{{.Version}}"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "{{.DarwinArm64.URL}}"
+      sha256 "{{.DarwinArm64.SHA256}}"
+    end
+    on_intel do
+      url "{{.DarwinAmd64.URL}}"
+      sha256 "{{.DarwinAmd64.SHA256}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "{{.LinuxArm64.URL}}"
+      sha256 "{{.LinuxArm64.SHA256}}"
+    end
+    on_intel do
+      url "{{.LinuxAmd64.URL}}"
+      sha256 "{{.LinuxAmd64.SHA256}}"
+    end
+  end
+
+  def install
+    bin.install "canary"
+    bin.install_symlink "canary" => "go-canary-cli"
+  end
+
+  test do
+    assert_match "canary v#{version}", shell_output("#{bin}/canary --version")
+    assert_match "canary v#{version}", shell_output("#{bin}/go-canary-cli --version")
+  end
+end

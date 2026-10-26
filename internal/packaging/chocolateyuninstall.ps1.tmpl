@@ -1,0 +1,5 @@
+$ErrorActionPreference = 'Stop'
+
+$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+Uninstall-BinFile -Name 'go-canary-cli' -Path (Join-Path $toolsDir 'canary.exe')
